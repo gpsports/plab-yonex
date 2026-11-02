@@ -245,6 +245,12 @@ var COMPANY_LABELS = {"Analog Devices":"Analog Devices (ADI)","Efinix Technology
    SSD alone got 23, and the very first counter (TinyFaceDetector) found nobody at all in the 15- and 18-person teams (README,
    "Photo check"). On 5 Oct the owner's ams OSRAM photo (12 players, 4 passers-by) counted 16; step 3 makes it 12, and changes
    nothing on the others. The thresholds below were chosen on those photos.
+   4. Tidying (2 Nov 2026, fcTidy): every photo captains actually sent for P.LAB Cup (54 files, 52 different photos) was counted by
+      hand, face by face, and the counter's mistakes studied. All were EXTRA faces — a hand, a fan or a certificate taken for a
+      face, one face boxed twice, someone tiny far behind, a sliver beside a face — never a missed one. fcTidy removes those kinds;
+      its settings (and APART, raised from 0.62) were tuned on those photos. Before: right on 18 of the 52. After: 38. Tuned on half
+      of them and checked on the other half it had not seen: 36 of 52 (the old counter, 18). What is left is mostly people of other
+      teams standing close beside the team — the captain's − / + and the desk handle those.
    Pure geometry first (tested in Node), then the parts that need the browser. */
 var FACECOUNT = {
   MIN: 0.35,         // SSD's lowest score that is looked at
@@ -259,7 +265,15 @@ var FACECOUNT = {
   YN_ADD: 0.8,       // YuNet adds a face only from this score up …
   YN_SIZE: 0.7,      // … and only at least this fraction of the typical width of the faces SSD is sure of
   GROUP: 3.5,        // two faces stand together when their centres are within this many face widths (the average of the two) …
-  APART: 0.62        // … and a group in which every face is narrower than this fraction of the photo's typical face is passers-by
+  APART: 0.7,        // … and a group in which every face is narrower than this fraction of the photo's typical face is passers-by
+  AGREE: 0.1,        // a face only SSD sees (YuNet's boxes overlap it less than this) …
+  ALONE: 0.7,        // … counts only from this SSD score up
+  TALL: 2.35,        // a box more than this many times as tall as wide is not a face (an arm, a flagpole, the edge of a face)
+  TINY: 0.4,         // a face narrower than this fraction of the photo's typical face is someone far behind
+  TWIN_IOM: 0.2,     // two boxes overlapping this much of the smaller one, with centres closer than TWIN_CD face widths, …
+  TWIN_CD: 0.95,
+  TWIN_LOW: 0.3,     // … where YuNet hardly agrees with one (under this) …
+  TWIN_GAP: 0.2      // … and agrees with the other at least this much more, are one face seen twice: the weaker box goes
 };
 
 function fcOverlap(a, b) {   // { iou, iom }: the boxes' intersection over their union, and over the smaller box
@@ -347,6 +361,35 @@ function fcNoPassersBy(boxes) {
   return boxes.filter(function (b, i) { return big[top(i)]; });
 }
 
+/* Tidy the count (2 Nov 2026, from the 54 photos captains sent for P.LAB Cup — counted by hand, face by face): the counter's mistakes
+   were all extra faces, of four kinds, and each rule below removed only those on all 54:
+   1. a hand, a fist, a fan, a certificate: SSD sees a face there, YuNet does not — a face only SSD sees counts only when SSD is sure;
+   2. a box much taller than wide (an arm, the edge of a face beside one already counted);
+   3. someone tiny far behind the team;
+   4. one face boxed twice — the boxes overlap, their centres under a face apart, and YuNet sees a face in one but hardly in the
+      other: the weaker goes. (Two real faces overlap like that too, one peeking over a shoulder, but YuNet sees both.)
+   `yn` is YuNet's own boxes; without them (YuNet could not run) rules 1 and 4 are skipped. */
+function fcTidy(boxes, yn) {
+  if (boxes.length < 3) return boxes.slice();
+  var ref = fcMedian(boxes.map(function (b) { return b.w; }));
+  function agree(b) { return yn ? yn.reduce(function (m, y) { return Math.max(m, fcOverlap(b, y).iou); }, 0) : 1; }
+  var out = boxes.filter(function (b) {
+    if (b.h > FACECOUNT.TALL * b.w || b.w < FACECOUNT.TINY * ref) return false;
+    return !yn || b.score >= FACECOUNT.ALONE || agree(b) >= FACECOUNT.AGREE;
+  });
+  if (!yn) return out;
+  var gone = {};
+  for (var i = 0; i < out.length; i++) for (var j = i + 1; j < out.length; j++) {
+    var a = out[i], b = out[j], o = fcOverlap(a, b);
+    if (o.iom <= FACECOUNT.TWIN_IOM) continue;
+    var cd = Math.sqrt(Math.pow(a.x + a.w / 2 - b.x - b.w / 2, 2) + Math.pow(a.y + a.h / 2 - b.y - b.h / 2, 2)) / Math.max(a.w, b.w);
+    if (cd >= FACECOUNT.TWIN_CD) continue;
+    var ga = agree(a), gb = agree(b);
+    if (Math.min(ga, gb) < FACECOUNT.TWIN_LOW && Math.abs(ga - gb) >= FACECOUNT.TWIN_GAP) gone[ga >= gb ? j : i] = true;
+  }
+  return out.filter(function (b, k) { return !gone[k]; });
+}
+
 /* YuNet's raw output → face boxes. `out` maps 'cls_8' … 'bbox_32' to flat arrays (one value per grid cell, four per box), for an
    input padded to pw × ph (multiples of 32). The decoding is OpenCV's (FaceDetectorYN): per stride s, a cell (r, c) scores
    √(cls · obj); its box centre is ((c + dx) · s, (r + dy) · s) and its size (e^dw · s, e^dh · s). Then non-maximum suppression. */
@@ -398,7 +441,7 @@ function ynRun(ort, session, canvas) {
    → { faces, boxes: [{x, y, w, h, score}], looks }. `quarters === false` skips SSD's second look (a phone without WebGL, where each
    look takes seconds). If YuNet fails on this photo the count is SSD's alone. */
 function faceCount(f, canvas, quarters, yn) {
-  var W = canvas.width, H = canvas.height, opts = new f.SsdMobilenetv1Options({ minConfidence: FACECOUNT.MIN, maxResults: 300 }), looks = 1;
+  var ynBoxes = null, W = canvas.width, H = canvas.height, opts = new f.SsdMobilenetv1Options({ minConfidence: FACECOUNT.MIN, maxResults: 300 }), looks = 1;
   function look(c, t) {
     return f.detectAllFaces(c, opts).then(function (found) {
       var out = [];
@@ -426,9 +469,9 @@ function faceCount(f, canvas, quarters, yn) {
   }).then(function (all) {
     var ssd = fcDedup(fcKeep(all));
     if (!yn) return ssd;
-    return ynRun(yn.ort, yn.session, canvas).then(function (y) { looks++; return fcSecondOpinion(ssd, y); }, function () { return ssd; });
+    return ynRun(yn.ort, yn.session, canvas).then(function (y) { looks++; ynBoxes = y; return fcSecondOpinion(ssd, y); }, function () { return ssd; });
   }).then(function (kept) {
-    kept = fcNoPassersBy(kept);
+    kept = fcNoPassersBy(fcTidy(kept, ynBoxes));
     return { faces: kept.length, boxes: kept, looks: looks };
   });
 }
