@@ -390,6 +390,49 @@ function fcTidy(boxes, yn) {
   return out.filter(function (b, k) { return !gone[k]; });
 }
 
+/* Who is in the team (6 Nov 2026, the owner: "the algo needs to define more parameters to be able to define people in the photo").
+   Every face in the 52 photos captains sent was marked in or out of the team by hand (matched to the owner's own counts), ~20
+   measurements were taken of each, and boosted decision stumps learnt which matter and how much. Left: 9 checks on 6 measurements:
+     sizeLocal  the face's width against its 4 nearest neighbours' (someone behind the team is smaller than the people beside them)
+     yn         how well YuNet agrees there is a face here (hands, fans, slivers: SSD alone sees them)
+     turn       how far the head is turned, from YuNet's eyes and nose (the team faces the camera; the next team in the queue less so)
+     overlap    how much the box covers another face (a face boxed twice, someone peeking over a shoulder)
+     score      SSD's own certainty;  gap2: distance to the second-nearest face, in face widths (a lone face apart from the group)
+   A face counts when its checks add up above FC_TEAM_CUT. Judged fairly (each photo counted by a model trained without it): right on
+   40 of 52 (77%; before, 37 = 71%). Sharpness, brightness, place in the group, edges and the body under the face were tried and added
+   nothing. Without YuNet (very old phones) nothing changes. */
+var FC_TEAM_CUT = -1.75;
+var FC_TEAM = [   // [measurement, threshold, add when below, add when at or above]
+  ['yn', 0.4785, -0.956, 0.3642],
+  ['sizeLocal', 0.7565, -2.2188, 0.4199],
+  ['turn', 0.2033, 0.2978, -1.1533],
+  ['yn', 0.402, -0.1667, 0.0524],
+  ['overlap', 0.1084, 0.2212, -0.9387],
+  ['score', 0.7919, -0.232, 0.2543],
+  ['sizeLocal', 0.6663, -0.3742, 0.0488],
+  ['gap2', 4.7843, 0.104, -0.4627],
+  ['overlap', 0.2007, 0.0258, -0.1577]
+];
+function fcTeamFeatures(f, boxes, yn, mw) {
+  var cx = f.x + f.w / 2, cy = f.y + f.h / 2, best = null, bi = 0.3;
+  var near = boxes.map(function (g) { return [Math.sqrt(Math.pow(g.x + g.w / 2 - cx, 2) + Math.pow(g.y + g.h / 2 - cy, 2)), g.w]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(1, 5).map(function (a) { return a[1]; });
+  var d = boxes.map(function (g) { return g === f ? 1e9 : Math.sqrt(Math.pow(g.x + g.w / 2 - cx, 2) + Math.pow(g.y + g.h / 2 - cy, 2)) / ((f.w + g.w) / 2); }).sort(function (a, b) { return a - b; });
+  yn.forEach(function (y) { var i = fcOverlap(f, y).iou; if (i > bi) { bi = i; best = y; } });
+  var turn = 0.5;
+  if (best && best.k && best.k.length === 5) { var le = best.k[0], re = best.k[1], ed = Math.sqrt(Math.pow(re[0] - le[0], 2) + Math.pow(re[1] - le[1], 2)) || 1; turn = Math.abs((best.k[2][0] - (le[0] + re[0]) / 2) / ed); }
+  return { sizeLocal: f.w / (fcMedian(near) || mw), score: f.score, turn: turn, gap2: Math.min(d[1] || 6, 6),
+    yn: yn.reduce(function (m, y) { return Math.max(m, fcOverlap(f, y).iou); }, 0),
+    overlap: boxes.reduce(function (m, g) { return g === f ? m : Math.max(m, fcOverlap(f, g).iom); }, 0) };
+}
+function fcTeam(boxes, yn) {
+  if (!yn || !boxes.length) return boxes.slice();
+  var mw = fcMedian(boxes.map(function (b) { return b.w; }));
+  return boxes.filter(function (f) {
+    var x = fcTeamFeatures(f, boxes, yn, mw);
+    return FC_TEAM.reduce(function (a, s) { return a + (x[s[0]] < s[1] ? s[2] : s[3]); }, 0) > FC_TEAM_CUT;
+  });
+}
+
 /* YuNet's raw output → face boxes. `out` maps 'cls_8' … 'bbox_32' to flat arrays (one value per grid cell, four per box), for an
    input padded to pw × ph (multiples of 32). The decoding is OpenCV's (FaceDetectorYN): per stride s, a cell (r, c) scores
    √(cls · obj); its box centre is ((c + dx) · s, (r + dy) · s) and its size (e^dw · s, e^dh · s). Then non-maximum suppression. */
@@ -400,8 +443,9 @@ function ynDecode(out, pw, ph) {
     for (var r = 0; r < rows; r++) for (var c = 0; c < cols; c++) {
       var i = r * cols + c, score = Math.sqrt(Math.min(1, Math.max(0, cls[i])) * Math.min(1, Math.max(0, obj[i])));
       if (score < FACECOUNT.YN_MIN) continue;
-      var w = Math.exp(bb[i * 4 + 2]) * s, h = Math.exp(bb[i * 4 + 3]) * s;
-      boxes.push({ x: (c + bb[i * 4]) * s - w / 2, y: (r + bb[i * 4 + 1]) * s - h / 2, w: w, h: h, score: score });
+      var w = Math.exp(bb[i * 4 + 2]) * s, h = Math.exp(bb[i * 4 + 3]) * s, kp = out['kps_' + s], k = [];
+      if (kp) for (var q = 0; q < 5; q++) k.push([(c + kp[i * 10 + 2 * q]) * s, (r + kp[i * 10 + 2 * q + 1]) * s]);   // eyes, nose, mouth corners
+      boxes.push({ x: (c + bb[i * 4]) * s - w / 2, y: (r + bb[i * 4 + 1]) * s - h / 2, w: w, h: h, score: score, k: k });
     }
   });
   var keep = [];
@@ -471,7 +515,7 @@ function faceCount(f, canvas, quarters, yn) {
     if (!yn) return ssd;
     return ynRun(yn.ort, yn.session, canvas).then(function (y) { looks++; ynBoxes = y; return fcSecondOpinion(ssd, y); }, function () { return ssd; });
   }).then(function (kept) {
-    kept = fcNoPassersBy(fcTidy(kept, ynBoxes));
+    kept = fcTeam(fcNoPassersBy(fcTidy(kept, ynBoxes)), ynBoxes);
     return { faces: kept.length, boxes: kept, looks: looks };
   });
 }
